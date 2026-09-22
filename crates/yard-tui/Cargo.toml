@@ -1,0 +1,10 @@
+[package]
+name = "yard-tui"
+description = "ratatui dashboard: items × state × agent × mergeable, pending-gate queue, agent logs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yard-core.workspace = true
+anyhow.workspace = true

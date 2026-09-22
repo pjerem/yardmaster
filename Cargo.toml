@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/yard-core", "crates/yard-daemon", "crates/yard-tui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+yard-core = { path = "crates/yard-core" }
+yard-daemon = { path = "crates/yard-daemon" }
+yard-tui = { path = "crates/yard-tui" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[package]
+name = "yardmaster"
+description = "Orchestrates N coding agents on N tickets, from intake to merge. Never drives a train."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yard"
+path = "src/main.rs"
+
+[dependencies]
+yard-core.workspace = true
+yard-daemon.workspace = true
+yard-tui.workspace = true
+anyhow.workspace = true
+clap.workspace = true

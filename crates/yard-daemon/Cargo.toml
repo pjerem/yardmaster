@@ -1,0 +1,10 @@
+[package]
+name = "yard-daemon"
+description = "Scheduler, sync loops, agent supervision, IPC server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yard-core.workspace = true
+anyhow.workspace = true

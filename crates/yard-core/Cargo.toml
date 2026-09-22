@@ -1,0 +1,9 @@
+[package]
+name = "yard-core"
+description = "Domain types, state machine, gate engine, config, event log, adapter traits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
