@@ -4,7 +4,10 @@
 //! No network I/O, no LLM calls, no process spawning — those live in
 //! `yard-daemon`. See SPEC.md §Domain model.
 
+pub mod adapters;
 pub mod config;
+pub mod gate;
 pub mod ipc;
 pub mod paths;
+pub mod state;
 pub mod storage;
