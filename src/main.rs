@@ -11,6 +11,9 @@ struct Cli {}
 fn main() -> anyhow::Result<()> {
     let Cli {} = Cli::parse();
     // Increment 1 (socle) starts here: config load, daemon self-spawn, `status`.
-    println!("yardmaster {} — nothing to coordinate yet. See SPEC.md.", env!("CARGO_PKG_VERSION"));
+    println!(
+        "yardmaster {} — nothing to coordinate yet. See SPEC.md.",
+        env!("CARGO_PKG_VERSION")
+    );
     Ok(())
 }

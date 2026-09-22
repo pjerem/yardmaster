@@ -1,0 +1,111 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Guard first so a tag/manifest mismatch fails fast, before any build minutes burn.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches workspace version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "yardmaster") | .version')"
+          echo "tag: ${tag_version} / Cargo.toml: ${cargo_version}"
+          if [ "${tag_version}" != "${cargo_version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${cargo_version}"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            # rusqlite is `bundled` (compiles C), so aarch64-musl needs a full cross
+            # C toolchain, not just a rustup target. `cross` ships a container image
+            # with the matching musl gcc baked in — more boring/reliable than wiring
+            # up linker + CC env vars by hand, at the cost of a slower first build.
+            use-cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-gcc for the bundled sqlite3 C sources (native x86_64 musl build).
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --bin yard --target ${{ matrix.target }}
+          else
+            cargo build --release --bin yard --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          archive="yard-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" yard
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yard-${{ github.ref_name }}-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum yard-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/yard-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
