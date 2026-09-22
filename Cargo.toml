@@ -47,3 +47,13 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+cucumber = "0.21"
+futures = "0.3"
+# BDD suite: event-log assertions read the daemon's sqlite db directly.
+rusqlite.workspace = true
+# BDD suite: pid liveness checks + SIGKILL fallback in scenario cleanup.
+libc = "0.2"
+
+[[test]]
+name = "bdd"
+harness = false
