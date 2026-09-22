@@ -1,8 +1,9 @@
-//! Blocking JSON-lines IPC client for CLI commands (`status`, `daemon stop`).
+//! Blocking JSON-lines IPC client for CLI commands.
 //!
 //! Speaks the exact `yard_core::ipc` wire protocol over a std `UnixStream`
-//! with short I/O timeouts: CLI invocations must fail fast, never hang on a
-//! wedged daemon.
+//! with per-call read timeouts: quick queries fail fast on a wedged daemon,
+//! while scheduler-driving commands (`add`, `approve`, …) get room for the
+//! provider/forge/git round trips they trigger.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -14,9 +15,12 @@ use serde_json::Value;
 use yard_core::ipc::{HelloFrame, Method, PROTO_VERSION, Request, Response};
 use yard_core::paths;
 
-/// Per-read/write socket timeout. Every daemon method is a handful of local
-/// SQLite reads; anything slower than this means a wedged daemon.
+/// Per-read/write socket timeout for quick methods (local SQLite reads) and
+/// the connection handshake; anything slower means a wedged daemon.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// Read timeout for scheduler-driving methods: ticket fetch, worktree
+/// creation, agent spawn, or PR creation happen before the reply.
+pub const SLOW_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Client {
     reader: BufReader<UnixStream>,
@@ -66,22 +70,32 @@ impl Client {
         })
     }
 
-    /// Sends one request and reads its response line. Today's methods take no
-    /// params, so none are exposed.
+    /// Sends one parameterless request with the quick timeout.
     pub fn request(&mut self, method: Method) -> anyhow::Result<Value> {
+        self.call(method, None, IO_TIMEOUT)
+    }
+
+    /// Sends one request and reads its response line, waiting up to
+    /// `timeout` for the reply.
+    pub fn call(
+        &mut self,
+        method: Method,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        let request = Request {
-            id,
-            method,
-            params: None,
-        };
+        let request = Request { id, method, params };
         let mut buf = serde_json::to_vec(&request).context("serializing request")?;
         buf.push(b'\n');
         self.writer
             .write_all(&buf)
             .with_context(|| format!("sending {method} request"))?;
 
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .context("setting read timeout")?;
         let mut line = String::new();
         let n = self
             .reader

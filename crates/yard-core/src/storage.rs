@@ -52,6 +52,10 @@ const MIGRATIONS: &[&str] = &[
         resolved_by TEXT
     );
     CREATE INDEX idx_gate_requests_pending ON gate_requests(work_item_id, status);",
+    // v2: agent session handle per work item (M2 agent supervision). The
+    // session id is the ProcessRunner directory name under the daemon's
+    // sessions root; NULL = no agent started yet.
+    "ALTER TABLE work_items ADD COLUMN agent_session TEXT;",
 ];
 
 #[derive(Debug, Error)]
@@ -278,6 +282,24 @@ impl Storage {
 
     pub fn set_work_item_pr_ref(&self, id: i64, pr_ref: &str) -> Result<(), StorageError> {
         self.set_work_item_field(id, "pr_ref", pr_ref)
+    }
+
+    /// Records the agent session driving a work item (see `[agents.*]` /
+    /// ProcessRunner). Overwritten on resume-after-restart.
+    pub fn set_work_item_agent_session(&self, id: i64, session: &str) -> Result<(), StorageError> {
+        self.set_work_item_field(id, "agent_session", session)
+    }
+
+    /// Agent session recorded for a work item; `None` = no agent started.
+    pub fn work_item_agent_session(&self, id: i64) -> Result<Option<String>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT agent_session FROM work_items WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StorageError::WorkItemNotFound(id))
     }
 
     /// `column` comes only from the fixed set above — never caller input.
@@ -542,19 +564,64 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_db_at_version_1() {
+    fn open_creates_db_at_current_version() {
         let (dir, storage) = open_temp();
         assert!(dir.path().join(DB_FILE).exists());
         let version: i64 = storage
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, MIGRATIONS.len() as i64);
         let fk: i64 = storage
             .conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn v1_database_migrates_and_gains_agent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // Hand-build a v1 database exactly as the shipped v1 batch did.
+            let mut conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0]).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let storage = Storage::open(dir.path()).unwrap();
+        let id = storage
+            .create_work_item("gh", "acme/app#1", "backend", "tracked")
+            .unwrap();
+        assert_eq!(storage.work_item_agent_session(id).unwrap(), None);
+        storage.set_work_item_agent_session(id, "abc123").unwrap();
+        assert_eq!(
+            storage.work_item_agent_session(id).unwrap().as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn agent_session_round_trips_and_missing_item_errors() {
+        let (_dir, storage) = open_temp();
+        let id = storage
+            .create_work_item("gh", "acme/app#2", "backend", "tracked")
+            .unwrap();
+        assert_eq!(storage.work_item_agent_session(id).unwrap(), None);
+        storage.set_work_item_agent_session(id, "s-1").unwrap();
+        assert_eq!(
+            storage.work_item_agent_session(id).unwrap().as_deref(),
+            Some("s-1")
+        );
+        assert!(matches!(
+            storage.work_item_agent_session(id + 1),
+            Err(StorageError::WorkItemNotFound(_))
+        ));
+        assert!(matches!(
+            storage.set_work_item_agent_session(id + 1, "x"),
+            Err(StorageError::WorkItemNotFound(_))
+        ));
     }
 
     #[test]

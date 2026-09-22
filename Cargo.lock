@@ -2500,6 +2500,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
  "yard-core",
  "yard-daemon",
  "yard-tui",

@@ -300,7 +300,7 @@ impl AgentRunner for ProcessRunner {
 
         // Exit determination: a recorded `exit_code` is authoritative (immune
         // to pid reuse); otherwise probe the recorded pid.
-        let exit_record = read_optional(&dir.join(EXIT_FILE))?;
+        let mut exit_record = read_optional(&dir.join(EXIT_FILE))?;
         let exited = match &exit_record {
             Some(_) => true,
             None => match read_pid(&dir)? {
@@ -311,6 +311,18 @@ impl AgentRunner for ProcessRunner {
         };
         if !exited {
             return Ok(AgentStatus::Running);
+        }
+        // The waiter records `exit_code` moments after the child dies; grant a
+        // bounded grace window before concluding the record is lost (daemon
+        // restarted mid-flight). Keeps status() race-free with a live waiter.
+        if exit_record.is_none() && read_pid(&dir)?.is_some() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                exit_record = read_optional(&dir.join(EXIT_FILE))?;
+                if exit_record.is_some() {
+                    break;
+                }
+            }
         }
 
         if let Some(raw) = read_optional(&dir.join(RESULT_FILE))? {

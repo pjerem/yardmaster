@@ -55,6 +55,8 @@ futures = "0.3"
 rusqlite.workspace = true
 # BDD suite: pid liveness checks + SIGKILL fallback in scenario cleanup.
 libc = "0.2"
+# E2E BDD: mocks the GitHub ticket + forge APIs on localhost.
+wiremock.workspace = true
 
 [[test]]
 name = "bdd"
