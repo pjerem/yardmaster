@@ -68,6 +68,10 @@ pub enum StorageError {
     UnsupportedVersion { found: i64, supported: i64 },
     #[error("work item {0} not found")]
     WorkItemNotFound(i64),
+    #[error("gate request {0} not found")]
+    GateRequestNotFound(i64),
+    #[error("gate request {id} is not pending (status: {status}); double-resolve rejected")]
+    GateRequestNotPending { id: i64, status: String },
 }
 
 /// Mirrors the `work_items` table.
@@ -94,6 +98,19 @@ pub struct EventRow {
     pub actor: String,
     pub kind: String,
     pub payload: Value,
+}
+
+/// Mirrors the `gate_requests` table; `payload` is the parsed JSON column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateRequestRow {
+    pub id: i64,
+    pub work_item_id: i64,
+    pub action_kind: String,
+    pub payload: Value,
+    pub status: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<String>,
 }
 
 pub struct Storage {
@@ -236,6 +253,172 @@ impl Storage {
         tx.commit()?;
         Ok(())
     }
+
+    /// Fetches one work item by id.
+    pub fn get_work_item(&self, id: i64) -> Result<WorkItemRow, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, provider, ticket_key, repo, state, branch, worktree_path, pr_ref,
+                        created_at, updated_at
+                 FROM work_items WHERE id = ?1",
+                [id],
+                work_item_from_row,
+            )
+            .optional()?
+            .ok_or(StorageError::WorkItemNotFound(id))
+    }
+
+    pub fn set_work_item_branch(&self, id: i64, branch: &str) -> Result<(), StorageError> {
+        self.set_work_item_field(id, "branch", branch)
+    }
+
+    pub fn set_work_item_worktree(&self, id: i64, worktree_path: &str) -> Result<(), StorageError> {
+        self.set_work_item_field(id, "worktree_path", worktree_path)
+    }
+
+    pub fn set_work_item_pr_ref(&self, id: i64, pr_ref: &str) -> Result<(), StorageError> {
+        self.set_work_item_field(id, "pr_ref", pr_ref)
+    }
+
+    /// `column` comes only from the fixed set above — never caller input.
+    fn set_work_item_field(&self, id: i64, column: &str, value: &str) -> Result<(), StorageError> {
+        let changed = self.conn.execute(
+            &format!("UPDATE work_items SET {column} = ?1, updated_at = ?2 WHERE id = ?3"),
+            params![value, now_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::WorkItemNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Inserts a pending gate request and appends a `gate_requested` event
+    /// (payload `{"gate_id", "action"}`) in the same transaction. Returns the
+    /// gate request id.
+    pub fn create_gate_request(
+        &mut self,
+        work_item_id: i64,
+        action_kind: &str,
+        payload: &Value,
+    ) -> Result<i64, StorageError> {
+        let tx = self.conn.transaction()?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM work_items WHERE id = ?1",
+                [work_item_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StorageError::WorkItemNotFound(work_item_id));
+        }
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO gate_requests (work_item_id, action_kind, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![work_item_id, action_kind, payload.to_string(), now],
+        )?;
+        let gate_id = tx.last_insert_rowid();
+        let event = serde_json::json!({ "gate_id": gate_id, "action": action_kind });
+        insert_event(
+            &tx,
+            Some(work_item_id),
+            "system",
+            "gate_requested",
+            &event,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(gate_id)
+    }
+
+    /// Resolves a pending gate request (`verdict` = `"approved"` or
+    /// `"rejected"`) and appends the matching `gate_<verdict>` event (payload
+    /// `{"gate_id", "action"[, "reason"]}`) in the same transaction. The
+    /// UPDATE is guarded on `status = 'pending'`: resolving twice (or a
+    /// missing id) is an error.
+    pub fn resolve_gate_request(
+        &mut self,
+        id: i64,
+        verdict: &str,
+        actor: &str,
+        reason: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        let row: Option<(i64, String, String)> = tx
+            .query_row(
+                "SELECT work_item_id, action_kind, status FROM gate_requests WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((work_item_id, action_kind, status)) = row else {
+            return Err(StorageError::GateRequestNotFound(id));
+        };
+        let now = now_rfc3339();
+        let changed = tx.execute(
+            "UPDATE gate_requests SET status = ?1, resolved_at = ?2, resolved_by = ?3
+             WHERE id = ?4 AND status = 'pending'",
+            params![verdict, now, actor, id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::GateRequestNotPending { id, status });
+        }
+        let mut event = serde_json::json!({ "gate_id": id, "action": action_kind });
+        if let Some(reason) = reason {
+            event["reason"] = reason.into();
+        }
+        insert_event(
+            &tx,
+            Some(work_item_id),
+            actor,
+            &format!("gate_{verdict}"),
+            &event,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetches one gate request by id.
+    pub fn get_gate_request(&self, id: i64) -> Result<GateRequestRow, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, work_item_id, action_kind, payload, status, created_at,
+                        resolved_at, resolved_by
+                 FROM gate_requests WHERE id = ?1",
+                [id],
+                gate_request_from_row,
+            )
+            .optional()?
+            .ok_or(StorageError::GateRequestNotFound(id))
+    }
+
+    /// Pending gate requests in creation order; `Some(id)` filters to one
+    /// work item.
+    pub fn pending_gate_requests(
+        &self,
+        work_item_id: Option<i64>,
+    ) -> Result<Vec<GateRequestRow>, StorageError> {
+        const BASE: &str = "SELECT id, work_item_id, action_kind, payload, status, created_at,
+                                   resolved_at, resolved_by
+                            FROM gate_requests WHERE status = 'pending'";
+        let rows = match work_item_id {
+            Some(id) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!("{BASE} AND work_item_id = ?1 ORDER BY id"))?;
+                let rows = stmt.query_map([id], gate_request_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            None => {
+                let mut stmt = self.conn.prepare(&format!("{BASE} ORDER BY id"))?;
+                let rows = stmt.query_map([], gate_request_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(rows)
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
@@ -285,6 +468,38 @@ fn event_from_row(row: &Row) -> rusqlite::Result<EventRow> {
         actor: row.get(3)?,
         kind: row.get(4)?,
         payload,
+    })
+}
+
+fn work_item_from_row(row: &Row) -> rusqlite::Result<WorkItemRow> {
+    Ok(WorkItemRow {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        ticket_key: row.get(2)?,
+        repo: row.get(3)?,
+        state: row.get(4)?,
+        branch: row.get(5)?,
+        worktree_path: row.get(6)?,
+        pr_ref: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn gate_request_from_row(row: &Row) -> rusqlite::Result<GateRequestRow> {
+    let raw: String = row.get(3)?;
+    let payload = serde_json::from_str(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(GateRequestRow {
+        id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        action_kind: row.get(2)?,
+        payload,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        resolved_at: row.get(6)?,
+        resolved_by: row.get(7)?,
     })
 }
 
@@ -495,6 +710,30 @@ mod tests {
         }
         assert_eq!(storage.count_pending_gates(id).unwrap(), 2);
         assert_eq!(storage.count_pending_gates(id + 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn field_setters_update_row_and_reject_missing_item() {
+        let (_dir, storage) = open_temp();
+        let id = storage
+            .create_work_item("github", "acme/app#1", "app", "developing")
+            .unwrap();
+        storage.set_work_item_branch(id, "feat/app-1").unwrap();
+        storage.set_work_item_worktree(id, "/tmp/wt/app-1").unwrap();
+        storage.set_work_item_pr_ref(id, "acme/app#12").unwrap();
+        let row = storage.get_work_item(id).unwrap();
+        assert_eq!(row.branch.as_deref(), Some("feat/app-1"));
+        assert_eq!(row.worktree_path.as_deref(), Some("/tmp/wt/app-1"));
+        assert_eq!(row.pr_ref.as_deref(), Some("acme/app#12"));
+
+        assert!(matches!(
+            storage.set_work_item_branch(999, "x"),
+            Err(StorageError::WorkItemNotFound(999))
+        ));
+        assert!(matches!(
+            storage.get_work_item(999),
+            Err(StorageError::WorkItemNotFound(999))
+        ));
     }
 
     #[test]
