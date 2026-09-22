@@ -2446,7 +2446,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yard-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "yard-daemon"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "keyring",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "yard-tui"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "yard-core",
@@ -2487,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "yardmaster"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
