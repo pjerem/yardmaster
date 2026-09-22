@@ -163,3 +163,12 @@ potentiellement open source.
   meilleur ROI connu, phase 2.
 - Event log append-only par ticket dès le début (quasi gratuit tôt).
 - Daemon + TUI qui s'attache (sinon perte de travail à la fermeture du terminal).
+
+## Addendum 2026-09-22 — post-kickoff
+- Repo créé : https://github.com/pjerem/yardmaster (public, MIT). 24 issues / 5 milestones.
+- Autonomie déléguée à l'orchestrateur (cette session puis yardmaster lui-même) :
+  commits/push/merge autorisés sur CE repo, merge conditionné à CI VERTE.
+  Les actions publiques ailleurs restent 🔴.
+- Exigence de test : BDD (Gherkin/cucumber) au niveau du binaire `yard` pour
+  les critères d'acceptation ; tests unitaires par module en complément.
+- Binaire nommé `yard` ; identité commits = Jérémy P. <72425+pjerem@users.noreply.github.com>.

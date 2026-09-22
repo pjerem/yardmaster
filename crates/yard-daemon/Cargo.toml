@@ -8,3 +8,12 @@ license.workspace = true
 [dependencies]
 yard-core.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# pid liveness probe (`kill(pid, 0)`) for the single-instance lock.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
