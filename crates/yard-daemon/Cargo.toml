@@ -14,8 +14,16 @@ tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+# secrets: 0600 fallback file store (secrets.toml).
+toml.workspace = true
 # pid liveness probe (`kill(pid, 0)`) for the single-instance lock.
 libc = "0.2"
+
+# macOS-only Keychain backend. Deliberately NOT enabled on Linux: the
+# secret-service backend drags in libdbus (broke CI, can't link static musl);
+# Linux falls back to the 0600 file store.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 tempfile.workspace = true
