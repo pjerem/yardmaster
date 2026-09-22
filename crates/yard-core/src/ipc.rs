@@ -32,8 +32,9 @@ pub struct HelloFrame {
     pub hello: Hello,
 }
 
-/// Client request. `params` is reserved for future methods; today's methods
-/// take none and clients may omit the field entirely.
+/// Client request. Methods that take arguments (`add`, `approve`, `reject`,
+/// `logs`) carry them in `params` as the JSON encoding of the typed structs
+/// below; parameterless methods omit the field entirely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
@@ -49,6 +50,16 @@ pub enum Method {
     Status,
     Subscribe,
     Shutdown,
+    /// Track a ticket and drive it: worktree, agent, checks, gates.
+    Add,
+    /// List pending 🔴 gate requests.
+    Gates,
+    /// Approve a pending gate request (executes the gated action).
+    Approve,
+    /// Reject a pending gate request (escalates the work item).
+    Reject,
+    /// Agent transcript path + tail for one work item.
+    Logs,
 }
 
 impl Method {
@@ -58,6 +69,11 @@ impl Method {
             Method::Status => "status",
             Method::Subscribe => "subscribe",
             Method::Shutdown => "shutdown",
+            Method::Add => "add",
+            Method::Gates => "gates",
+            Method::Approve => "approve",
+            Method::Reject => "reject",
+            Method::Logs => "logs",
         }
     }
 }
@@ -175,6 +191,110 @@ pub struct WorkItemStatus {
     pub mergeable: Option<bool>,
 }
 
+// ---------------------------------------------------------------------------
+// Method params/results (M2: add / gates / approve / reject / logs)
+
+/// `params` of an `add` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddParams {
+    /// Ticket reference `<provider>:<key>` (e.g. `gh:owner/repo#23`); the
+    /// prefix may be omitted when exactly one provider is configured.
+    pub ticket: String,
+    /// Repo config name; may be omitted when exactly one repo is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Branch-template `{type}`; defaults to `feature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+}
+
+/// `data` of a successful `add` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddResult {
+    pub id: i64,
+    pub ticket: String,
+    pub repo: String,
+    pub branch: String,
+    pub worktree: String,
+    pub state: String,
+}
+
+/// `data` of a successful `gates` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateList {
+    pub gates: Vec<GateInfo>,
+}
+
+/// One pending gate request with its work-item context. `payload` is the
+/// exact side effect awaiting approval (e.g. the full PR draft).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateInfo {
+    pub id: i64,
+    pub work_item_id: i64,
+    pub ticket: String,
+    pub repo: String,
+    pub action: String,
+    pub created_at: String,
+    pub payload: Value,
+}
+
+/// `params` of an `approve` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveParams {
+    pub gate_id: i64,
+}
+
+/// `data` of a successful `approve` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveResult {
+    pub gate_id: i64,
+    pub work_item_id: i64,
+    pub action: String,
+    /// `owner/repo#N` once the approved action created a PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    /// Work-item state after execution.
+    pub state: String,
+}
+
+/// `params` of a `reject` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectParams {
+    pub gate_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `data` of a successful `reject` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectResult {
+    pub gate_id: i64,
+    pub work_item_id: i64,
+    /// Work-item state after the rejection (escalated).
+    pub state: String,
+}
+
+/// `params` of a `logs` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsParams {
+    /// Work item id.
+    pub item: i64,
+    /// Max transcript lines returned (from the end); daemon default applies
+    /// when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<usize>,
+}
+
+/// `data` of a successful `logs` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResult {
+    /// Absolute transcript path, when the session has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    /// Last lines of the transcript, oldest first.
+    pub lines: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +351,11 @@ mod tests {
             (Method::Status, "status"),
             (Method::Subscribe, "subscribe"),
             (Method::Shutdown, "shutdown"),
+            (Method::Add, "add"),
+            (Method::Gates, "gates"),
+            (Method::Approve, "approve"),
+            (Method::Reject, "reject"),
+            (Method::Logs, "logs"),
         ] {
             assert_eq!(
                 serde_json::to_string(&method).unwrap(),
@@ -242,6 +367,65 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<Method>("\"reboot\"").is_err());
+    }
+
+    #[test]
+    fn add_params_wire_format() {
+        // `type` is a Rust keyword; the raw identifier must serialize bare.
+        let full = AddParams {
+            ticket: "gh:acme/app#7".into(),
+            repo: Some("backend".into()),
+            r#type: Some("fix".into()),
+        };
+        let wire = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"ticket":"gh:acme/app#7","repo":"backend","type":"fix"}"#
+        );
+        assert_eq!(serde_json::from_str::<AddParams>(&wire).unwrap(), full);
+
+        // Optional fields absent on the wire parse to None.
+        let minimal: AddParams = serde_json::from_str(r#"{"ticket":"acme/app#7"}"#).unwrap();
+        assert_eq!(minimal.repo, None);
+        assert_eq!(minimal.r#type, None);
+    }
+
+    #[test]
+    fn gate_and_result_payloads_round_trip() {
+        let list = GateList {
+            gates: vec![GateInfo {
+                id: 1,
+                work_item_id: 2,
+                ticket: "acme/app#7".into(),
+                repo: "backend".into(),
+                action: "create_pr".into(),
+                created_at: "2026-09-22T10:00:00Z".into(),
+                payload: json!({"title": "acme/app#7: fix"}),
+            }],
+        };
+        let wire = serde_json::to_string(&list).unwrap();
+        assert_eq!(serde_json::from_str::<GateList>(&wire).unwrap(), list);
+
+        let approve = ApproveResult {
+            gate_id: 1,
+            work_item_id: 2,
+            action: "create_pr".into(),
+            pr: Some("acme/app#9".into()),
+            state: "pr_pending".into(),
+        };
+        let wire = serde_json::to_string(&approve).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ApproveResult>(&wire).unwrap(),
+            approve
+        );
+
+        let logs = LogsResult {
+            transcript_path: None,
+            lines: vec!["hello".into()],
+        };
+        let wire = serde_json::to_string(&logs).unwrap();
+        assert_eq!(wire, r#"{"lines":["hello"]}"#);
+        assert_eq!(serde_json::from_str::<LogsResult>(&wire).unwrap(), logs);
     }
 
     #[test]

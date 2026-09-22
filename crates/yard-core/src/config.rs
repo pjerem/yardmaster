@@ -2,8 +2,22 @@
 //! templating/slug helpers used to derive branch names.
 //!
 //! Schema (see SPEC.md §Configuration): `[profile]`, `[providers.<name>]`,
-//! `[repos.<name>]`, `[budgets]`. Unknown keys are rejected so typos surface
-//! as precise parse errors instead of silently-ignored settings.
+//! `[agents.<name>]`, `[repos.<name>]`, `[budgets]`. Unknown keys are
+//! rejected so typos surface as precise parse errors instead of
+//! silently-ignored settings.
+//!
+//! ## Agent backends (`[agents.<name>]`)
+//!
+//! Argv templates handed to the daemon's process runner; `{placeholders}`
+//! (`{worktree}`, `{instructions_file}`, `{session_dir}`, `{message_file}`,
+//! `{ticket_key}`) are substituted per session. The name `omp` has a
+//! built-in default (flags verified against omp v18.2.3), equivalent to:
+//!
+//! ```toml
+//! [agents.omp]
+//! start_cmd  = ["omp", "-p", "@{instructions_file}", "--cwd", "{worktree}", "--session-dir", "{session_dir}"]
+//! resume_cmd = ["omp", "-p", "@{message_file}", "--cwd", "{worktree}", "--session-dir", "{session_dir}", "-c"]
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +30,9 @@ use crate::paths;
 /// Provider kinds this build knows how to drive. `kind` stays a plain string
 /// in the schema so future kinds only extend this list.
 pub const KNOWN_PROVIDER_KINDS: &[&str] = &["jira", "github", "local"];
+
+/// Default API base URL for `kind = "github"` providers that omit `url`.
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Placeholders allowed in `branch_template`.
 pub const BRANCH_TEMPLATE_VARS: &[&str] = &["type", "ticket", "slug"];
@@ -43,6 +60,7 @@ pub enum ConfigError {
 pub struct Config {
     pub profile: Profile,
     pub providers: BTreeMap<String, Provider>,
+    pub agents: BTreeMap<String, Agent>,
     pub repos: BTreeMap<String, Repo>,
     pub budgets: Budgets,
 }
@@ -74,6 +92,57 @@ pub struct Provider {
     pub user: Option<String>,
 }
 
+impl Provider {
+    /// API base URL: the configured `url`, defaulting to the public GitHub
+    /// API. Only meaningful for `kind = "github"` entries, which use one URL
+    /// (and one token) for both the ticket API and the forge API.
+    pub fn api_url(&self) -> String {
+        self.url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GITHUB_API_URL.to_owned())
+    }
+}
+
+/// One agent backend: argv templates handed to the daemon's process runner.
+/// See the module docs for the placeholder table and the built-in `omp`
+/// default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    /// Argv template used to start a session; must be non-empty.
+    pub start_cmd: Vec<String>,
+    /// Argv template used to resume a session; absent = not resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cmd: Option<Vec<String>>,
+}
+
+/// The built-in `omp` backend used when no `[agents.omp]` section overrides
+/// it. Flags verified against omp v18.2.3 `--help`.
+pub fn builtin_omp_agent() -> Agent {
+    let arg = |s: &str| s.to_owned();
+    Agent {
+        start_cmd: vec![
+            arg("omp"),
+            arg("-p"),
+            arg("@{instructions_file}"),
+            arg("--cwd"),
+            arg("{worktree}"),
+            arg("--session-dir"),
+            arg("{session_dir}"),
+        ],
+        resume_cmd: Some(vec![
+            arg("omp"),
+            arg("-p"),
+            arg("@{message_file}"),
+            arg("--cwd"),
+            arg("{worktree}"),
+            arg("--session-dir"),
+            arg("{session_dir}"),
+            arg("-c"),
+        ]),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
@@ -92,6 +161,50 @@ pub struct Repo {
     pub ci_retry_cap: u32,
     #[serde(default)]
     pub merge_policy: MergePolicy,
+    /// Name of the `[providers.*]` entry owning this repo's tickets and
+    /// forge API. Required for `yard add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// `owner/name` on the forge; target of PR creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_repo: Option<String>,
+    /// Name of the `[agents.*]` backend driving this repo's work items;
+    /// defaults to the built-in `omp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Directory under which worktrees are created; default: sibling
+    /// `<repo_dir>-worktrees` next to `path` (see [`Repo::worktrees_root`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees_root: Option<PathBuf>,
+    /// Optional `setup-worktree` hook argv, run inside a fresh worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_hook: Vec<String>,
+    /// Optional `teardown-worktree` hook argv, run before worktree removal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teardown_hook: Vec<String>,
+}
+
+impl Repo {
+    /// Effective worktrees root: the configured `worktrees_root`, defaulting
+    /// to a sibling directory `<repo_dir>-worktrees` next to the clone.
+    pub fn worktrees_root(&self) -> PathBuf {
+        match &self.worktrees_root {
+            Some(root) => root.clone(),
+            None => {
+                let name = self
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "repo".to_owned());
+                self.path.with_file_name(format!("{name}-worktrees"))
+            }
+        }
+    }
+
+    /// Backend name driving this repo's work items (`agent`, default `omp`).
+    pub fn agent_name(&self) -> &str {
+        self.agent.as_deref().unwrap_or("omp")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,7 +281,19 @@ impl Config {
         for repo in self.repos.values_mut() {
             // TOML strings are valid UTF-8, so the lossy round-trip is exact.
             repo.path = paths::expand_tilde(&repo.path.to_string_lossy());
+            if let Some(root) = &repo.worktrees_root {
+                repo.worktrees_root = Some(paths::expand_tilde(&root.to_string_lossy()));
+            }
         }
+    }
+
+    /// Resolves an agent backend by name; the name `omp` falls back to the
+    /// built-in default when no `[agents.omp]` section overrides it.
+    pub fn agent(&self, name: &str) -> Option<Agent> {
+        self.agents
+            .get(name)
+            .cloned()
+            .or_else(|| (name == "omp").then(builtin_omp_agent))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -180,6 +305,13 @@ impl Config {
                         provider.kind,
                         KNOWN_PROVIDER_KINDS.join(", ")
                     ),
+                });
+            }
+        }
+        for (name, agent) in &self.agents {
+            if agent.start_cmd.is_empty() {
+                return Err(ConfigError::Validation {
+                    msg: format!("agent '{name}': start_cmd must not be empty"),
                 });
             }
         }
@@ -195,6 +327,25 @@ impl Config {
                         ),
                     });
                 }
+            }
+            if let Some(provider) = &repo.provider
+                && !self.providers.contains_key(provider)
+            {
+                return Err(ConfigError::Validation {
+                    msg: format!(
+                        "repo '{name}': provider \"{provider}\" is not a configured \
+                         [providers.*] entry"
+                    ),
+                });
+            }
+            if self.agent(repo.agent_name()).is_none() {
+                return Err(ConfigError::Validation {
+                    msg: format!(
+                        "repo '{name}': agent \"{}\" is not a configured [agents.*] \
+                         entry (the built-in \"omp\" needs no section)",
+                        repo.agent_name()
+                    ),
+                });
             }
         }
         Ok(())
@@ -487,6 +638,143 @@ mod tests {
 
         let err = render_template("{type", &vars).expect_err("unclosed brace");
         assert!(matches!(err, ConfigError::Validation { .. }), "{err}");
+    }
+
+    #[test]
+    fn agents_and_repo_extensions_round_trip() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.gh]
+            kind = "github"
+            user = "me"
+
+            [agents.stub]
+            start_cmd = ["/bin/sh", "run.sh", "{session_dir}"]
+
+            [repos.app]
+            path = "/opt/app"
+            forge = "github"
+            provider = "gh"
+            remote_repo = "acme/app"
+            agent = "stub"
+            worktrees_root = "/opt/worktrees"
+            setup_hook = ["./setup.sh"]
+            teardown_hook = ["./teardown.sh"]
+            "#,
+        )
+        .expect("parse");
+        config.validate().expect("valid");
+
+        let app = &config.repos["app"];
+        assert_eq!(app.provider.as_deref(), Some("gh"));
+        assert_eq!(app.remote_repo.as_deref(), Some("acme/app"));
+        assert_eq!(app.agent_name(), "stub");
+        assert_eq!(app.worktrees_root(), PathBuf::from("/opt/worktrees"));
+        assert_eq!(app.setup_hook, ["./setup.sh"]);
+        assert_eq!(app.teardown_hook, ["./teardown.sh"]);
+        assert_eq!(
+            config.agents["stub"].start_cmd,
+            ["/bin/sh", "run.sh", "{session_dir}"]
+        );
+        assert_eq!(config.agents["stub"].resume_cmd, None);
+
+        // serialize -> reparse must stay lossless with the new fields
+        let rendered = toml::to_string(&config).expect("serialize");
+        let reparsed: Config = toml::from_str(&rendered).expect("reparse");
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn worktrees_root_defaults_to_sibling_directory() {
+        let config: Config = toml::from_str(
+            r#"
+            [repos.app]
+            path = "/home/me/dev/backend"
+            forge = "github"
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            config.repos["app"].worktrees_root(),
+            PathBuf::from("/home/me/dev/backend-worktrees")
+        );
+    }
+
+    #[test]
+    fn builtin_omp_agent_is_resolvable_and_overridable() {
+        let config: Config = toml::from_str(
+            r#"
+            [repos.app]
+            path = "/opt/app"
+            forge = "github"
+            "#,
+        )
+        .expect("parse");
+        config.validate().expect("default agent name resolves");
+        assert_eq!(config.repos["app"].agent_name(), "omp");
+        let omp = config.agent("omp").expect("built-in omp");
+        assert_eq!(omp.start_cmd[0], "omp");
+        assert!(omp.resume_cmd.is_some());
+
+        let overridden: Config = toml::from_str(
+            r#"
+            [agents.omp]
+            start_cmd = ["my-omp"]
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            overridden.agent("omp").expect("configured omp").start_cmd,
+            ["my-omp"]
+        );
+        assert_eq!(overridden.agent("nope"), None);
+    }
+
+    #[test]
+    fn unknown_repo_provider_is_validation_error() {
+        let config: Config = toml::from_str(
+            r#"
+            [repos.app]
+            path = "/opt/app"
+            forge = "github"
+            provider = "ghost"
+            "#,
+        )
+        .expect("parse");
+        let err = config.validate().expect_err("must reject unknown provider");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Validation { .. }), "{msg}");
+        assert!(msg.contains("ghost") && msg.contains("'app'"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_repo_agent_is_validation_error() {
+        let config: Config = toml::from_str(
+            r#"
+            [repos.app]
+            path = "/opt/app"
+            forge = "github"
+            agent = "hal9000"
+            "#,
+        )
+        .expect("parse");
+        let err = config.validate().expect_err("must reject unknown agent");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Validation { .. }), "{msg}");
+        assert!(msg.contains("hal9000") && msg.contains("'app'"), "{msg}");
+    }
+
+    #[test]
+    fn empty_agent_start_cmd_is_validation_error() {
+        let config: Config = toml::from_str(
+            r#"
+            [agents.stub]
+            start_cmd = []
+            "#,
+        )
+        .expect("parse");
+        let err = config.validate().expect_err("must reject empty start_cmd");
+        assert!(err.to_string().contains("start_cmd"), "{err}");
     }
 
     #[test]

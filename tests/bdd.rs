@@ -1,5 +1,6 @@
-//! Cucumber BDD suite for milestone M1 (socle): daemon lifecycle, `yard
-//! status`, and config handling — see `tests/features/`.
+//! Cucumber BDD suite: milestone M1 (socle — daemon lifecycle, `yard
+//! status`, config handling) plus the M2 end-to-end ticket→PR flow. See
+//! `tests/features/`.
 //!
 //! Every scenario drives the real `yard` binary. Isolation: a per-scenario
 //! tempdir provides the state dir and config path, exported to each spawned
@@ -7,6 +8,11 @@
 //! `Command`, never on the test process itself, so scenarios can run
 //! concurrently. Scenario teardown stops (then SIGKILLs) any daemon it
 //! started, keeping repeated local runs and CI clean.
+//!
+//! The E2E sandbox is fully offline: a local source repo pushing to a local
+//! BARE remote, a wiremock server standing in for both the GitHub issue API
+//! and the forge, a `/bin/sh` stub as the agent backend, and a dummy token
+//! injected through the `YARDMASTER_SECRET_*` env fallback.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -34,6 +40,10 @@ pub struct YardWorld {
     /// Foreground `yard daemon run` children spawned by this scenario; reaped
     /// on teardown so no zombies accumulate across the suite.
     daemon_children: Vec<Child>,
+    /// Mocked GitHub API (issues + pulls) for the E2E sandbox.
+    mock: Option<wiremock::MockServer>,
+    /// E2E sandbox variant: `check_command` that always fails.
+    check_fails: bool,
 }
 
 #[derive(Debug)]
@@ -50,6 +60,8 @@ impl YardWorld {
             last: None,
             remembered_pid: None,
             daemon_children: Vec::new(),
+            mock: None,
+            check_fails: false,
         }
     }
 
@@ -70,12 +82,15 @@ impl YardWorld {
     }
 
     /// A `yard` command wired to this scenario's isolated state dir + config.
+    /// The dummy provider token rides the `YARDMASTER_SECRET_*` env fallback
+    /// (harmless for scenarios without providers).
     fn yard_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(YARD_BIN);
         command
             .args(args)
             .env("YARDMASTER_STATE_DIR", self.state_dir())
-            .env("YARDMASTER_CONFIG", self.config_path());
+            .env("YARDMASTER_CONFIG", self.config_path())
+            .env("YARDMASTER_SECRET_PROVIDERS_GH", "dummy-test-token");
         command
     }
 
@@ -126,6 +141,183 @@ impl YardWorld {
             .ok()
             .filter(|&pid| pid > 0)
     }
+
+    // ----------------------------------------------------------- e2e sandbox
+
+    fn repo_dir(&self) -> PathBuf {
+        self.tmp.path().join("repo")
+    }
+
+    fn remote_dir(&self) -> PathBuf {
+        self.tmp.path().join("remote.git")
+    }
+
+    fn agent_script(&self) -> PathBuf {
+        self.tmp.path().join("agent.sh")
+    }
+
+    /// Local source repo + BARE origin remote + stub agent script + wiremock
+    /// GitHub API (issue GET, pulls POST) + a config wiring them together.
+    /// Everything offline; the daemon under test never leaves localhost.
+    async fn setup_sandbox(&mut self, assignee: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Source repo with one commit on main, pushing to a local bare remote.
+        let repo = self.repo_dir();
+        let remote = self.remote_dir();
+        git(self.tmp.path(), &["init", "-q", "-b", "main", "repo"]);
+        git(&repo, &["config", "user.name", "Yard Test"]);
+        git(&repo, &["config", "user.email", "yard@test.invalid"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README.md"), "# demo\n").expect("writing README");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "initial commit"]);
+        git(
+            self.tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // Stub agent: leaves a commit in the worktree (cwd) and reports
+        // success through the ProcessRunner backend contract ($1 = session
+        // dir, stdout lands in transcript.log).
+        std::fs::write(
+            self.agent_script(),
+            concat!(
+                "#!/bin/sh\n",
+                "set -e\n",
+                "echo \"stub agent starting in $PWD\"\n",
+                "echo \"frobnicator\" > agent-work.txt\n",
+                "git add agent-work.txt\n",
+                "git commit -q -m \"agent: add frobnicator\"\n",
+                "printf '{\"success\": true, \"summary\": \"implemented the frobnicator\"}'",
+                " > \"$1/result.json\"\n",
+            ),
+        )
+        .expect("writing agent script");
+
+        // Mocked GitHub API: one open issue and a pulls endpoint.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widgets/issues/23"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 23,
+                "title": "Add frobnicator",
+                "body": "Please add the frobnicator.",
+                "state": "open",
+                "assignee": { "login": assignee },
+                "html_url": "https://github.test/acme/widgets/issues/23",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/widgets/pulls"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "number": 7,
+            })))
+            .mount(&server)
+            .await;
+        self.mock = Some(server);
+
+        self.write_sandbox_config();
+    }
+
+    /// (Re)writes the sandbox config; called again when a variant step flips
+    /// a knob (e.g. the failing check command).
+    fn write_sandbox_config(&self) {
+        let mock_uri = self.mock.as_ref().expect("sandbox not set up").uri();
+        let check_line = if self.check_fails {
+            "check_command = [\"/bin/sh\", \"-c\", \"echo boom >&2; exit 1\"]\n"
+        } else {
+            ""
+        };
+        let config = format!(
+            "[providers.gh]\n\
+             kind = \"github\"\n\
+             url = \"{mock_uri}\"\n\
+             user = \"testuser\"\n\
+             \n\
+             [agents.stub]\n\
+             start_cmd = [\"/bin/sh\", \"{script}\", \"{{session_dir}}\"]\n\
+             \n\
+             [repos.demo]\n\
+             path = \"{repo}\"\n\
+             forge = \"github\"\n\
+             base = \"main\"\n\
+             provider = \"gh\"\n\
+             remote_repo = \"acme/widgets\"\n\
+             agent = \"stub\"\n\
+             {check_line}",
+            script = self.agent_script().display(),
+            repo = self.repo_dir().display(),
+        );
+        std::fs::write(self.config_path(), config).expect("writing sandbox config");
+    }
+
+    /// `yard <args> --json`-style helper: runs the command, asserts success,
+    /// parses stdout.
+    fn yard_json(&self, args: &[&str]) -> serde_json::Value {
+        let result = self.run_yard(args);
+        assert_eq!(
+            result.code,
+            Some(0),
+            "`yard {}` failed\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            result.stdout,
+            result.stderr
+        );
+        serde_json::from_str(&result.stdout).expect("JSON output")
+    }
+
+    /// State of the single sandbox work item, per `yard status --json`.
+    fn item_state(&self) -> String {
+        let report = self.yard_json(&["status", "--json"]);
+        report["items"][0]["state"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no work item in status report: {report}"))
+            .to_owned()
+    }
+
+    /// `(kind, payload)` event rows of work item 1, in insertion order, read
+    /// straight from the daemon's WAL-mode sqlite (readers never block).
+    fn item_events(&self) -> Vec<(String, serde_json::Value)> {
+        let conn = rusqlite::Connection::open(self.state_dir().join("yardmaster.db"))
+            .expect("opening event-log db");
+        let mut stmt = conn
+            .prepare("SELECT kind, payload FROM events WHERE work_item_id = 1 ORDER BY id")
+            .expect("preparing events query");
+        let rows = stmt
+            .query_map([], |row| {
+                let kind: String = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Ok((kind, payload))
+            })
+            .expect("querying events");
+        rows.map(|row| {
+            let (kind, payload) = row.expect("event row");
+            let payload = serde_json::from_str(&payload).expect("event payload JSON");
+            (kind, payload)
+        })
+        .collect()
+    }
+
+    /// POST requests the mocked forge received on its pulls endpoint.
+    async fn pr_creations(&self) -> Vec<wiremock::Request> {
+        self.mock
+            .as_ref()
+            .expect("sandbox not set up")
+            .received_requests()
+            .await
+            .expect("wiremock request recording enabled")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/pulls"))
+            .collect()
+    }
 }
 
 impl Drop for YardWorld {
@@ -158,6 +350,42 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Runs `git -C <dir> <args>`, panicking with captured output on failure —
+/// sandbox construction must never fail silently.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("running git");
+    assert!(
+        out.status.success(),
+        "git -C {} {} failed\nstdout: {}\nstderr: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// True when `refs/heads/<branch>` exists in the (bare) repo at `dir`.
+fn has_branch(dir: &std::path::Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .expect("running git rev-parse")
+        .status
+        .success()
+}
+
 #[given("a fresh state directory")]
 async fn fresh_state_dir(world: &mut YardWorld) {
     // Fresh by construction (per-scenario tempdir); assert it as a guard.
@@ -176,6 +404,17 @@ async fn config_file(world: &mut YardWorld, step: &Step) {
         .expect("this step requires a docstring")
         .trim();
     std::fs::write(world.config_path(), doc).expect("writing scenario config");
+}
+
+#[given(expr = "an e2e sandbox with the ticket assigned to {string}")]
+async fn e2e_sandbox(world: &mut YardWorld, assignee: String) {
+    world.setup_sandbox(&assignee).await;
+}
+
+#[given("the sandbox check command fails")]
+async fn sandbox_failing_check(world: &mut YardWorld) {
+    world.check_fails = true;
+    world.write_sandbox_config();
 }
 
 #[given(regex = r#"^a daemon started with "yard daemon run"$"#)]
@@ -343,6 +582,167 @@ async fn event_recorded(world: &mut YardWorld, kind: String) {
         )
         .expect("querying events");
     assert!(count >= 1, "no {kind:?} event in {}", db.display());
+}
+
+// ------------------------------------------------------------- e2e thens --
+
+#[then("the daemon reports no work items")]
+async fn daemon_no_items(world: &mut YardWorld) {
+    let report = world.yard_json(&["status", "--json"]);
+    assert_eq!(
+        report["items"],
+        serde_json::json!([]),
+        "expected an empty backlog: {report}"
+    );
+}
+
+#[then(expr = "within {int} seconds a {string} gate is pending")]
+async fn gate_pending_within(world: &mut YardWorld, secs: u64, action: String) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let gates = world.yard_json(&["gates", "--json"]);
+        let pending = gates["gates"]
+            .as_array()
+            .expect("gates array")
+            .iter()
+            .any(|gate| gate["action"] == action.as_str());
+        if pending {
+            return;
+        }
+        // Escalation means the pipeline failed; surface the audit trail
+        // instead of a blind timeout.
+        let state = world.item_state();
+        assert_ne!(
+            state,
+            "escalated",
+            "work item escalated while waiting for a {action} gate; events: {:#?}",
+            world.item_events()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no pending {action} gate after {secs}s (item state {state}); events: {:#?}",
+            world.item_events()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[then(expr = "within {int} seconds the work item is in state {string}")]
+async fn item_state_within(world: &mut YardWorld, secs: u64, expected: String) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let state = world.item_state();
+        if state == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "work item stuck in state {state} (wanted {expected}); events: {:#?}",
+            world.item_events()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[then(expr = "the work item is in state {string}")]
+async fn item_state_now(world: &mut YardWorld, expected: String) {
+    let state = world.item_state();
+    assert_eq!(state, expected, "events: {:#?}", world.item_events());
+}
+
+#[then("the work item worktree exists")]
+async fn worktree_exists(world: &mut YardWorld) {
+    let conn =
+        rusqlite::Connection::open(world.state_dir().join("yardmaster.db")).expect("opening db");
+    let path: String = conn
+        .query_row(
+            "SELECT worktree_path FROM work_items WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("work item 1 with a worktree path");
+    let path = PathBuf::from(path);
+    assert!(
+        path.is_dir(),
+        "worktree {} is not a directory",
+        path.display()
+    );
+    assert!(
+        path.join("agent-work.txt").is_file(),
+        "stub agent's file missing in {}",
+        path.display()
+    );
+}
+
+#[then(expr = "the bare remote has branch {string}")]
+async fn remote_has_branch(world: &mut YardWorld, branch: String) {
+    assert!(
+        has_branch(&world.remote_dir(), &branch),
+        "branch {branch} not on the bare remote"
+    );
+}
+
+#[then(expr = "the bare remote has no branch {string}")]
+async fn remote_has_no_branch(world: &mut YardWorld, branch: String) {
+    assert!(
+        !has_branch(&world.remote_dir(), &branch),
+        "branch {branch} unexpectedly pushed to the bare remote"
+    );
+}
+
+#[then(expr = "the forge received {int} PR creations")]
+async fn forge_pr_count(world: &mut YardWorld, expected: usize) {
+    let posts = world.pr_creations().await;
+    assert_eq!(
+        posts.len(),
+        expected,
+        "unexpected POST /pulls count: {posts:?}"
+    );
+}
+
+#[then(
+    expr = "the forge received exactly one PR creation for head {string} into {string} as a draft"
+)]
+async fn forge_pr_payload(world: &mut YardWorld, head: String, base: String) {
+    let posts = world.pr_creations().await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "expected exactly one POST /pulls: {posts:?}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&posts[0].body).expect("PR creation body is JSON");
+    assert_eq!(body["head"], head.as_str(), "payload: {body}");
+    assert_eq!(body["base"], base.as_str(), "payload: {body}");
+    assert_eq!(body["draft"], true, "payload: {body}");
+    assert!(
+        body["title"].as_str().is_some_and(|t| !t.is_empty()),
+        "payload: {body}"
+    );
+}
+
+/// Asserts the comma-separated event tokens appear as an ordered
+/// subsequence of work item 1's event log. A token is a kind
+/// (`branch_pushed`) or `state_changed:<new>` to pin the transition target.
+#[then(expr = "the item event log records, in order: {string}")]
+async fn events_in_order(world: &mut YardWorld, expected: String) {
+    let events = world.item_events();
+    let mut cursor = 0usize;
+    for token in expected.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let (kind, new_state) = match token.split_once(':') {
+            Some((kind, new_state)) => (kind, Some(new_state)),
+            None => (token, None),
+        };
+        let found = events[cursor..].iter().position(|(k, payload)| {
+            k == kind && new_state.is_none_or(|state| payload["new"] == state)
+        });
+        match found {
+            Some(offset) => cursor += offset + 1,
+            None => {
+                panic!("event {token:?} not found (in order) in the item event log:\n{events:#?}")
+            }
+        }
+    }
 }
 
 #[tokio::main]

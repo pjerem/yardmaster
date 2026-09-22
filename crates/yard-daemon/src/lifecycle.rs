@@ -1,9 +1,14 @@
-//! Daemon lifecycle: single-instance guard, storage, IPC serving, cleanup.
+//! Daemon lifecycle: single-instance guard, storage, scheduler, IPC serving,
+//! cleanup.
 //!
 //! [`run`] is the blocking entry point behind `yard daemon run`. Exactly one
 //! daemon owns a state directory at a time, guarded by `daemon.lock`
 //! (containing the owner's pid). A second `run` against a live daemon is a
 //! quiet no-op; a lock left behind by a dead process is reclaimed.
+//!
+//! The scheduler runs as one tokio task; the synchronous IPC handler (on the
+//! blocking pool, see `server::Handler`) reaches it over an mpsc command
+//! channel with oneshot replies — see `scheduler` module docs.
 //!
 //! Shutdown paths — a `shutdown` IPC request, SIGTERM, or SIGINT — all flip
 //! the same watch channel; `server::serve` returns, a `daemon_stopped` event
@@ -21,10 +26,14 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, watch};
 use yard_core::config::Config;
-use yard_core::ipc::{DaemonInfo, Method, StatusReport, WorkItemStatus};
+use yard_core::ipc::{
+    AddParams, ApproveParams, DaemonInfo, LogsParams, Method, RejectParams, StatusReport,
+    WorkItemStatus,
+};
 use yard_core::paths;
 use yard_core::storage::Storage;
 
+use crate::scheduler::{Command, Scheduler};
 use crate::server;
 
 /// Runs the daemon for `state_dir` in the foreground until shutdown.
@@ -35,7 +44,7 @@ use crate::server;
 pub fn run(state_dir: PathBuf) -> anyhow::Result<()> {
     // The daemon guards its own config: a broken config must fail loudly
     // here too, not only in the CLI that spawned us.
-    Config::load(None).context("loading configuration")?;
+    let config = Config::load(None).context("loading configuration")?;
 
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating state directory {}", state_dir.display()))?;
@@ -56,9 +65,13 @@ pub fn run(state_dir: PathBuf) -> anyhow::Result<()> {
     remove_if_exists(&socket)?;
     let _socket_guard = RemoveOnDrop(socket.clone());
 
-    let storage = Storage::open(&state_dir).context("opening storage")?;
+    let storage = Arc::new(Mutex::new(
+        Storage::open(&state_dir).context("opening storage")?,
+    ));
     let started_at = now_rfc3339();
     storage
+        .lock()
+        .expect("fresh storage mutex")
         .append_event(
             None,
             "daemon",
@@ -67,10 +80,18 @@ pub fn run(state_dir: PathBuf) -> anyhow::Result<()> {
         )
         .context("recording daemon_started event")?;
 
+    // Built here, outside any async context: the adapters' blocking HTTP
+    // clients must not be created on a runtime thread.
+    let scheduler = Scheduler::new(config.clone(), &state_dir, Arc::clone(&storage))
+        .context("building scheduler")?;
+    let (scheduler_tx, scheduler_rx) = tokio::sync::mpsc::channel(32);
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (events_tx, _) = broadcast::channel(64);
     let handler = Arc::new(DaemonHandler {
-        storage: Mutex::new(storage),
+        storage: Arc::clone(&storage),
+        config,
+        scheduler: scheduler_tx,
         state_dir: state_dir.clone(),
         started_at,
         shutdown: shutdown_tx.clone(),
@@ -84,6 +105,10 @@ pub fn run(state_dir: PathBuf) -> anyhow::Result<()> {
     let served = runtime.block_on(async {
         let listener =
             UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+
+        // The scheduler owns all mutable scheduling state; it exits when the
+        // handler (last command sender) drops at the end of run().
+        tokio::spawn(scheduler.run(scheduler_rx));
 
         // SIGTERM/SIGINT funnel into the same shutdown path as the IPC
         // `shutdown` request.
@@ -211,12 +236,14 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// IPC request handler backed by [`Storage`].
+/// IPC request handler backed by [`Storage`] and the scheduler channel.
 ///
-/// `Handler::handle` runs synchronously on the connection task, hence the
-/// blocking mutex: every method is a handful of local SQLite reads.
+/// `Handler::handle` runs on the blocking pool (see `server::Handler`), so
+/// blocking on the storage mutex and on scheduler oneshot replies is fine.
 struct DaemonHandler {
-    storage: Mutex<Storage>,
+    storage: Arc<Mutex<Storage>>,
+    config: Config,
+    scheduler: tokio::sync::mpsc::Sender<Command>,
     state_dir: PathBuf,
     /// RFC3339 UTC, captured once at boot.
     started_at: String,
@@ -224,7 +251,7 @@ struct DaemonHandler {
 }
 
 impl server::Handler for DaemonHandler {
-    fn handle(&self, method: &Method) -> Result<Value, String> {
+    fn handle(&self, method: &Method, params: Option<&Value>) -> Result<Value, String> {
         match method {
             Method::Ping => Ok(json!({})),
             Method::Status => self.status_report().map_err(|err| format!("{err:#}")),
@@ -235,6 +262,39 @@ impl server::Handler for DaemonHandler {
                 let _ = self.shutdown.send(true);
                 Ok(json!({}))
             }
+            Method::Add => {
+                let p: AddParams = parse_params(params)?;
+                self.roundtrip(|reply| Command::Add {
+                    ticket: p.ticket,
+                    repo: p.repo,
+                    ty: p.r#type,
+                    reply,
+                })
+            }
+            Method::Gates => self.roundtrip(|reply| Command::Gates { reply }),
+            Method::Approve => {
+                let p: ApproveParams = parse_params(params)?;
+                self.roundtrip(|reply| Command::Approve {
+                    gate_id: p.gate_id,
+                    reply,
+                })
+            }
+            Method::Reject => {
+                let p: RejectParams = parse_params(params)?;
+                self.roundtrip(|reply| Command::Reject {
+                    gate_id: p.gate_id,
+                    reason: p.reason,
+                    reply,
+                })
+            }
+            Method::Logs => {
+                let p: LogsParams = parse_params(params)?;
+                self.roundtrip(|reply| Command::Logs {
+                    item: p.item,
+                    tail: p.tail,
+                    reply,
+                })
+            }
             // Contract: subscribe is answered by the server itself and never
             // forwarded here.
             Method::Subscribe => Err("subscribe is handled by the server".to_owned()),
@@ -243,6 +303,22 @@ impl server::Handler for DaemonHandler {
 }
 
 impl DaemonHandler {
+    /// Sends one command into the scheduler task and blocks on its reply
+    /// (both sides of the async bridge documented in the module docs).
+    fn roundtrip<T: serde::Serialize>(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> Command,
+    ) -> Result<Value, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.scheduler
+            .blocking_send(make(reply_tx))
+            .map_err(|_| "scheduler is not running".to_owned())?;
+        let result = reply_rx
+            .blocking_recv()
+            .map_err(|_| "scheduler dropped the request".to_owned())??;
+        serde_json::to_value(result).map_err(|e| format!("serializing response: {e}"))
+    }
+
     fn status_report(&self) -> anyhow::Result<Value> {
         let storage = self
             .storage
@@ -253,12 +329,23 @@ impl DaemonHandler {
             let pending_gates = storage
                 .count_pending_gates(row.id)
                 .context("counting pending gates")?;
+            // Backend name once an agent session exists for the item.
+            let agent = storage
+                .work_item_agent_session(row.id)
+                .context("reading agent session")?
+                .map(|_| {
+                    self.config
+                        .repos
+                        .get(&row.repo)
+                        .map(|repo| repo.agent_name().to_owned())
+                        .unwrap_or_else(|| "omp".to_owned())
+                });
             items.push(WorkItemStatus {
                 id: row.id,
                 ticket: row.ticket_key,
                 repo: row.repo,
                 state: row.state,
-                agent: None, // agent supervision lands in M2
+                agent,
                 pending_gates,
                 mergeable: None, // merge-policy evaluation lands in M4
             });
@@ -274,6 +361,13 @@ impl DaemonHandler {
         };
         serde_json::to_value(report).context("serializing status report")
     }
+}
+
+/// Typed view over a request's `params`; a missing object only works for
+/// types whose fields are all optional, so required fields error precisely.
+fn parse_params<T: serde::de::DeserializeOwned>(params: Option<&Value>) -> Result<T, String> {
+    let value = params.cloned().unwrap_or(Value::Null);
+    serde_json::from_value(value).map_err(|e| format!("invalid params: {e}"))
 }
 
 /// Current time as an RFC3339 UTC string, seconds precision. Civil-date

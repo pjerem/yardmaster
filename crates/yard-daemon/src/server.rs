@@ -6,7 +6,11 @@
 //!
 //! ```ignore
 //! pub trait Handler: Send + Sync + 'static {
-//!     fn handle(&self, method: &yard_core::ipc::Method) -> Result<serde_json::Value, String>;
+//!     fn handle(
+//!         &self,
+//!         method: &yard_core::ipc::Method,
+//!         params: Option<&serde_json::Value>,
+//!     ) -> Result<serde_json::Value, String>;
 //! }
 //!
 //! pub async fn serve(
@@ -27,10 +31,11 @@
 //!   `Handler`): it answers `ok:true` with `{"subscribed":true}` and from then
 //!   on forwards every `EventMsg` published on `events` as an event line on
 //!   that connection. Publish daemon events via `events.send(…)`.
-//! - `ping`/`status`/`shutdown` go through `Handler::handle`, whose
+//! - Every other method goes through `Handler::handle`, whose
 //!   `Ok(data)`/`Err(msg)` becomes the `ok:true`/`ok:false` response.
-//!   `Handler::handle` runs synchronously on the connection task — keep it
-//!   fast and non-blocking.
+//!   `Handler::handle` runs on the blocking thread pool
+//!   (`tokio::task::spawn_blocking`), so it MAY block — e.g. on a scheduler
+//!   round trip — without starving the connection tasks.
 //! - **Shutdown**: `serve` does NOT stop on a `shutdown` request. The handler
 //!   answers `ok:true` and, as a side effect, flips the `watch::Sender<bool>`
 //!   to `true`; `serve` returns when its `watch::Receiver` observes `true`
@@ -50,8 +55,13 @@ use yard_core::ipc::{EventMsg, Hello, HelloFrame, Method, PROTO_VERSION, Request
 
 pub trait Handler: Send + Sync + 'static {
     /// Handle one request; `Ok(data)` / `Err(msg)` map to the wire
-    /// `ok:true` / `ok:false` response.
-    fn handle(&self, method: &Method) -> Result<serde_json::Value, String>;
+    /// `ok:true` / `ok:false` response. Runs on the blocking pool: blocking
+    /// (channels, SQLite, short waits) is allowed, async is not available.
+    fn handle(
+        &self,
+        method: &Method,
+        params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, String>;
 }
 
 /// Serve IPC connections until `shutdown` becomes `true` (or its sender is
@@ -156,10 +166,21 @@ async fn handle_connection(
                     subscription = Some(events.subscribe());
                     Response::ok(request.id, serde_json::json!({"subscribed": true}))
                 }
-                method => match handler.handle(&method) {
-                    Ok(data) => Response::ok(request.id, data),
-                    Err(error) => Response::err(request.id, error),
-                },
+                method => {
+                    // Off the connection task: handlers may block (scheduler
+                    // round trips, SQLite) — see the `Handler` contract.
+                    let handler = Arc::clone(&handler);
+                    let params = request.params;
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        handler.handle(&method, params.as_ref())
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(data)) => Response::ok(request.id, data),
+                        Ok(Err(error)) => Response::err(request.id, error),
+                        Err(join) => Response::err(request.id, format!("handler panicked: {join}")),
+                    }
+                }
             },
             Err(err) => Response::err(salvage_id(&line), format!("invalid request: {err}")),
         };
@@ -199,12 +220,13 @@ mod tests {
     struct StubHandler;
 
     impl Handler for StubHandler {
-        fn handle(&self, method: &Method) -> Result<Value, String> {
+        fn handle(&self, method: &Method, params: Option<&Value>) -> Result<Value, String> {
             match method {
-                Method::Ping => Ok(json!({"pong": true})),
+                // Echo params so tests can assert they were forwarded.
+                Method::Ping => Ok(json!({"pong": true, "params": params})),
                 Method::Status => Ok(json!({"items": []})),
                 Method::Shutdown => Ok(Value::Null),
-                Method::Subscribe => Err("subscribe must be intercepted by the server".into()),
+                _ => Err(format!("no stub for {method}")),
             }
         }
     }
@@ -286,8 +308,17 @@ mod tests {
         }
 
         let (ping, status) = tokio::join!(c1.request(1, "ping"), c2.request(2, "status"));
-        assert_eq!(ping, Response::ok(1, json!({"pong": true})));
+        assert_eq!(ping, Response::ok(1, json!({"pong": true, "params": null})));
         assert_eq!(status, Response::ok(2, json!({"items": []})));
+
+        // Params travel from the request line to the handler untouched.
+        c1.send_raw(r#"{"id":3,"method":"ping","params":{"n":7}}"#)
+            .await;
+        let with_params: Response = serde_json::from_str(&c1.read_line().await).unwrap();
+        assert_eq!(
+            with_params,
+            Response::ok(3, json!({"pong": true, "params": {"n": 7}}))
+        );
 
         server.shutdown.send(true).unwrap();
         server.serve_task.await.unwrap().unwrap();
@@ -314,7 +345,7 @@ mod tests {
 
         // The connection still answers requests while subscribed.
         let ping = client.request(2, "ping").await;
-        assert_eq!(ping, Response::ok(2, json!({"pong": true})));
+        assert_eq!(ping, Response::ok(2, json!({"pong": true, "params": null})));
 
         server.shutdown.send(true).unwrap();
         server.serve_task.await.unwrap().unwrap();
@@ -341,7 +372,7 @@ mod tests {
         assert!(resp.result.is_err());
 
         let ping = client.request(3, "ping").await;
-        assert_eq!(ping, Response::ok(3, json!({"pong": true})));
+        assert_eq!(ping, Response::ok(3, json!({"pong": true, "params": null})));
 
         server.shutdown.send(true).unwrap();
         server.serve_task.await.unwrap().unwrap();

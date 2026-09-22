@@ -11,7 +11,10 @@ use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use yard_core::config::Config;
-use yard_core::ipc::{Method, StatusReport};
+use yard_core::ipc::{
+    AddParams, AddResult, ApproveParams, ApproveResult, GateList, LogsParams, LogsResult, Method,
+    RejectParams, RejectResult, StatusReport,
+};
 use yard_core::paths;
 
 /// Orchestrates N coding agents on N tickets, from intake to merge.
@@ -24,11 +27,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Track a ticket and drive it: worktree, agent, checks, gates.
+    Add {
+        /// Ticket reference `<provider>:<key>` (e.g. `gh:owner/repo#23`);
+        /// the prefix may be omitted with a single configured provider.
+        ticket: String,
+        /// Repo config name; defaults to the only configured repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Branch-template `{type}` (feature, fix, …); default "feature".
+        #[arg(long = "type")]
+        ty: Option<String>,
+        /// Emit the raw add result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show daemon and work-item status (auto-starts the daemon).
     Status {
         /// Emit the raw status report as JSON instead of the table.
         #[arg(long)]
         json: bool,
+    },
+    /// List pending 🔴 gate requests.
+    Gates {
+        /// Emit the raw gate list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a pending gate request (executes the gated action).
+    Approve {
+        /// Gate id, as shown by `yard gates`.
+        gate_id: i64,
+    },
+    /// Reject a pending gate request (escalates the work item).
+    Reject {
+        /// Gate id, as shown by `yard gates`.
+        gate_id: i64,
+        /// Why the action must not happen; lands in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Show the agent transcript tail for a work item.
+    Logs {
+        /// Work item id, as shown by `yard status`.
+        item: i64,
+        /// Number of transcript lines from the end.
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
     },
     /// Explicit daemon control; the daemon is otherwise spawned on demand.
     Daemon {
@@ -67,7 +112,17 @@ fn main() -> anyhow::Result<()> {
     let state_dir = paths::state_dir();
 
     match command {
+        Command::Add {
+            ticket,
+            repo,
+            ty,
+            json,
+        } => cmd_add(&state_dir, ticket, repo, ty, json),
         Command::Status { json } => cmd_status(&state_dir, json),
+        Command::Gates { json } => cmd_gates(&state_dir, json),
+        Command::Approve { gate_id } => cmd_approve(&state_dir, gate_id),
+        Command::Reject { gate_id, reason } => cmd_reject(&state_dir, gate_id, reason),
+        Command::Logs { item, tail } => cmd_logs(&state_dir, item, tail),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => yard_daemon::lifecycle::run(state_dir),
@@ -90,6 +145,145 @@ fn cmd_status(state_dir: &Path, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_human(&report);
+    }
+    Ok(())
+}
+
+/// `yard add <ticket>`: track the ticket and drive it until the agent is
+/// working. Slow timeout: the daemon fetches the ticket, creates the
+/// worktree, and spawns the agent before replying.
+fn cmd_add(
+    state_dir: &Path,
+    ticket: String,
+    repo: Option<String>,
+    ty: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let params = AddParams {
+        ticket,
+        repo,
+        r#type: ty,
+    };
+    let mut client = ensure_daemon(state_dir)?;
+    let data = client.call(
+        Method::Add,
+        Some(serde_json::to_value(&params)?),
+        client::SLOW_TIMEOUT,
+    )?;
+    let result: AddResult = serde_json::from_value(data).context("parsing add result")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "work item #{}: {} on repo {}",
+            result.id, result.ticket, result.repo
+        );
+        println!("branch {} (worktree {})", result.branch, result.worktree);
+        println!("state: {} — agent running", result.state);
+    }
+    Ok(())
+}
+
+/// `yard gates [--json]`: pending 🔴 requests, one line each plus the exact
+/// payload essentials so the human knows what a yes means.
+fn cmd_gates(state_dir: &Path, json: bool) -> anyhow::Result<()> {
+    let mut client = ensure_daemon(state_dir)?;
+    let data = client.call(Method::Gates, None, client::SLOW_TIMEOUT)?;
+    let list: GateList = serde_json::from_value(data).context("parsing gate list")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.gates.is_empty() {
+        println!("no pending gates");
+        return Ok(());
+    }
+    for gate in &list.gates {
+        println!(
+            "gate #{} — {} for item #{} ({} on {}), requested {}",
+            gate.id, gate.action, gate.work_item_id, gate.ticket, gate.repo, gate.created_at
+        );
+        if gate.action == "create_pr" {
+            let p = &gate.payload;
+            println!(
+                "  PR draft: {} ({} → {}){}",
+                p["title"].as_str().unwrap_or("?"),
+                p["head"].as_str().unwrap_or("?"),
+                p["base"].as_str().unwrap_or("?"),
+                if p["draft"].as_bool().unwrap_or(false) {
+                    ", draft"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+    println!();
+    println!("approve with `yard approve <id>`, reject with `yard reject <id> --reason ...`");
+    Ok(())
+}
+
+/// `yard approve <gate-id>`: the 🔴 keypress. The daemon executes the gated
+/// action before replying.
+fn cmd_approve(state_dir: &Path, gate_id: i64) -> anyhow::Result<()> {
+    let params = ApproveParams { gate_id };
+    let mut client = ensure_daemon(state_dir)?;
+    let data = client.call(
+        Method::Approve,
+        Some(serde_json::to_value(&params)?),
+        client::SLOW_TIMEOUT,
+    )?;
+    let result: ApproveResult = serde_json::from_value(data).context("parsing approve result")?;
+    match &result.pr {
+        Some(pr) => println!(
+            "gate #{} approved — PR {pr} created, item #{} → {}",
+            result.gate_id, result.work_item_id, result.state
+        ),
+        None => println!(
+            "gate #{} approved — item #{} → {}",
+            result.gate_id, result.work_item_id, result.state
+        ),
+    }
+    Ok(())
+}
+
+/// `yard reject <gate-id> [--reason ...]`: refuse the gated action; the work
+/// item escalates for human follow-up.
+fn cmd_reject(state_dir: &Path, gate_id: i64, reason: Option<String>) -> anyhow::Result<()> {
+    let params = RejectParams { gate_id, reason };
+    let mut client = ensure_daemon(state_dir)?;
+    let data = client.call(
+        Method::Reject,
+        Some(serde_json::to_value(&params)?),
+        client::SLOW_TIMEOUT,
+    )?;
+    let result: RejectResult = serde_json::from_value(data).context("parsing reject result")?;
+    println!(
+        "gate #{} rejected — item #{} → {}",
+        result.gate_id, result.work_item_id, result.state
+    );
+    Ok(())
+}
+
+/// `yard logs <item> [--tail N]`: agent transcript tail for a work item.
+fn cmd_logs(state_dir: &Path, item: i64, tail: usize) -> anyhow::Result<()> {
+    let params = LogsParams {
+        item,
+        tail: Some(tail),
+    };
+    let mut client = ensure_daemon(state_dir)?;
+    let data = client.call(
+        Method::Logs,
+        Some(serde_json::to_value(&params)?),
+        client::SLOW_TIMEOUT,
+    )?;
+    let result: LogsResult = serde_json::from_value(data).context("parsing logs result")?;
+    match &result.transcript_path {
+        Some(path) => println!("transcript: {path}"),
+        None => println!("no transcript recorded yet"),
+    }
+    for line in &result.lines {
+        println!("{line}");
     }
     Ok(())
 }
